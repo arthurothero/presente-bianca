@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Para a Bianca</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #toggle {
+    position: fixed; right: 14px; bottom: 14px; z-index: 10;
+    font: 600 13px/1 'Courier New', monospace; letter-spacing: 1px;
+    color: #ffc2e0; background: rgba(255, 79, 160, 0.14);
+    border: 1px solid rgba(255, 194, 224, 0.45); border-radius: 999px;
+    padding: 9px 14px; cursor: pointer; backdrop-filter: blur(4px);
+  }
+  #toggle:hover { background: rgba(255, 79, 160, 0.28); }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-filters@6/dist/pixi-filters.min.js"></script>
+</head>
+<body>
+<button id="toggle">ASCII: ON</button>
+<script>
+(async () => {
+  const app = new PIXI.Application();
+  await app.init({
+    resizeTo: window, background: 0x000000, antialias: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true,
+  });
+  document.body.appendChild(app.canvas);
+
+  // ================= utilidades =================
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  const ease = x => { x = clamp01(x); return x * x * (3 - 2 * x); };
+  const easeOut = x => { x = clamp01(x); return 1 - (1 - x) * (1 - x); };
+  const easeBack = x => { x = clamp01(x); const c = 1.70158; return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+
+  function mix(a, b, t) {
+    const ch = s => ((a >> s) & 255) * (1 - t) + ((b >> s) & 255) * t;
+    return (Math.round(ch(16)) << 16) | (Math.round(ch(8)) << 8) | Math.round(ch(0));
+  }
+  const css = (n, a = 1) => `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+
+  function newCanvas(w, h) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    return [c, c.getContext('2d')];
+  }
+
+  // grão sutil só nos pixels visíveis (tira o aspecto "plástico")
+  function addNoise(ctx, w, h, amt) {
+    const img = ctx.getImageData(0, 0, w, h), d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] === 0) continue;
+      const n = (Math.random() - 0.5) * amt;
+      d[i] = Math.max(0, Math.min(255, d[i] + n));
+      d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + n));
+      d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + n));
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  // linha "borrada" (várias passadas) — substitui ctx.filter, que o Safari não tem
+  function softStroke(ctx, drawPath, color, widthMax, alphaMax) {
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 4; i >= 1; i--) {
+      ctx.lineWidth = widthMax * (i / 4);
+      ctx.strokeStyle = color.replace('ALPHA', (alphaMax / 3).toFixed(3));
+      drawPath();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function bezPt(p0, c1, c2, p3, u) {
+    const a = (1 - u) ** 3, b = 3 * (1 - u) ** 2 * u, c = 3 * (1 - u) * u * u, d = u ** 3;
+    return { x: a * p0.x + b * c1.x + c * c2.x + d * p3.x, y: a * p0.y + b * c1.y + c * c2.y + d * p3.y };
+  }
+
+  // ================= paleta (garganta, meio, ponta, borda, mancha) =================
+  const PAL = {
+    red:    { throat: 0x3a0508, mid: 0xc41a24, tip: 0xe23a34, edge: 0xf0605a, spot: 0x3a0508 },
+    pink:   { throat: 0x7a1a50, mid: 0xd84ca8, tip: 0xf59ad0, edge: 0xfde6f2, spot: 0x6a1048 },
+    cream:  { throat: 0xb8861a, mid: 0xf0e2c4, tip: 0xfff4de, edge: 0xffffff, spot: 0x9a5a1a },
+    yellow: { throat: 0xb85a08, mid: 0xf2b820, tip: 0xf9dc6a, edge: 0xfff0a0, spot: 0x8a3a08 },
+    peach:  { throat: 0xb0401c, mid: 0xf0a078, tip: 0xf8cdb0, edge: 0xfff0e4, spot: 0x8a2a10 },
+    dark:   { throat: 0x1c0204, mid: 0x7a1010, tip: 0x9a2424, edge: 0xb84040, spot: 0x1c0204 },
+    orange: { throat: 0x8a2808, mid: 0xf08a24, tip: 0xf8b454, edge: 0xffd08a, spot: 0x6a1a04 },
+    blush:  { throat: 0xc8407a, mid: 0xf4b6d0, tip: 0xfbe0ec, edge: 0xffffff, spot: 0xa02a62 },
+  };
+
+  // ================= TEXTURA: pétala de lírio =================
+  const PW = 130, PH = 320, PAD = 16;
+  const petalTextures = [];
+
+  function makePetalTexture(pal, inner) {
+    const W = PW + PAD * 2, H = PH + PAD * 2;
+    const [c, x] = newCanvas(W, H);
+    const cx = W / 2, by = PAD + PH, ty = PAD, hw = PW / 2 - 3;
+    const curl = rand(-9, 9), seed = rand(0, 50);
+
+    // contorno levemente ondulado
+    const P0 = { x: 0, y: 0 }, C1 = { x: hw * 1.35, y: -PH * 0.26 },
+          C2 = { x: hw * 1.25, y: -PH * 0.74 }, P3 = { x: curl, y: -PH };
+    const N = 48, pts = [];
+    for (let i = 0; i <= N; i++) {
+      const u = i / N, q = bezPt(P0, C1, C2, P3, u);
+      const r = (Math.sin(u * 20 + seed) * 0.9 + Math.sin(u * 7 + seed * 2) * 1.3) * Math.min(1, u * 5) * Math.sqrt(1 - u);
+      pts.push({ x: cx + q.x + r, y: by + q.y });
+    }
+    for (let i = N - 1; i >= 0; i--) {
+      const u = i / N, q = bezPt(P0, C1, C2, P3, u);
+      const r = (Math.sin(u * 17 + seed * 1.3) * 0.9 + Math.sin(u * 6 + seed) * 1.3) * Math.min(1, u * 5) * Math.sqrt(1 - u);
+      pts.push({ x: cx - q.x - r, y: by + q.y });
+    }
+    const outline = () => {
+      x.beginPath();
+      pts.forEach((p, i) => (i ? x.lineTo(p.x, p.y) : x.moveTo(p.x, p.y)));
+      x.closePath();
+    };
+
+    const mid = inner ? mix(pal.mid, 0xffffff, 0.1) : pal.mid;
+
+    // sombra projetada nas pétalas vizinhas
+    x.save();
+    x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 10; x.shadowOffsetY = 3;
+    outline(); x.fillStyle = css(mid); x.fill();
+    x.restore();
+
+    x.save();
+    outline(); x.clip();
+
+    // 1) cor ao longo da pétala: base verde -> garganta -> meio -> ponta
+    let g = x.createLinearGradient(0, by, 0, ty);
+    g.addColorStop(0.00, '#7a9a30');
+    g.addColorStop(0.07, css(mix(0x7a9a30, pal.throat, 0.7)));
+    g.addColorStop(0.20, css(pal.throat));
+    g.addColorStop(0.42, css(mid));
+    g.addColorStop(0.80, css(mix(mid, pal.tip, 0.6)));
+    g.addColorStop(1.00, css(pal.tip));
+    x.fillStyle = g; x.fillRect(0, 0, W, H);
+
+    // 2) bordas translúcidas e centro mais denso
+    g = x.createLinearGradient(cx - hw, 0, cx + hw, 0);
+    g.addColorStop(0.00, css(pal.edge, 0.42));
+    g.addColorStop(0.22, css(pal.edge, 0.0));
+    g.addColorStop(0.50, 'rgba(0,0,0,0.10)');
+    g.addColorStop(0.78, css(pal.edge, 0.0));
+    g.addColorStop(1.00, css(pal.edge, 0.42));
+    x.fillStyle = g; x.fillRect(0, 0, W, H);
+
+    // 3) luz vindo da esquerda
+    g = x.createLinearGradient(cx - hw, 0, cx + hw, 0);
+    g.addColorStop(0, 'rgba(255,255,255,0.14)');
+    g.addColorStop(1, 'rgba(0,0,0,0.20)');
+    x.fillStyle = g; x.fillRect(0, 0, W, H);
+
+    // 4) escurece perto do centro da flor (profundidade)
+    g = x.createLinearGradient(0, by, 0, by - PH * 0.3);
+    g.addColorStop(0, 'rgba(0,0,0,0.38)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = g; x.fillRect(0, 0, W, H);
+
+    // 5) nervuras paralelas
+    for (let k = -5; k <= 5; k++) {
+      const path = () => {
+        x.beginPath();
+        x.moveTo(cx + k * hw * 0.07, by - PH * 0.04);
+        x.quadraticCurveTo(cx + k * hw * 0.2, by - PH * 0.5, cx + curl * 0.85 + k * 1.2, ty + PH * 0.1);
+      };
+      x.lineWidth = 1.1; x.strokeStyle = 'rgba(255,255,255,0.10)'; path(); x.stroke();
+      x.save(); x.translate(1.2, 0);
+      x.lineWidth = 1.0; x.strokeStyle = 'rgba(0,0,0,0.10)'; path(); x.stroke();
+      x.restore();
+    }
+
+    // 6) sulco e relevo da nervura central
+    const rib = () => {
+      x.beginPath();
+      x.moveTo(cx, by);
+      x.quadraticCurveTo(cx + curl * 0.2, by - PH * 0.5, cx + curl * 0.9, ty + PH * 0.04);
+    };
+    softStroke(x, rib, 'rgba(0,0,0,ALPHA)', 8, 0.30);
+    x.save(); x.translate(-2, 0);
+    x.lineWidth = 1.6; x.strokeStyle = css(mix(mid, 0xffffff, 0.6), 0.45); rib(); x.stroke();
+    x.restore();
+
+    // 7) papilas (bolinhas em relevo), mais densas perto da base
+    const nSpots = inner ? 36 : 70;
+    for (let i = 0; i < nSpots; i++) {
+      const yf = Math.pow(Math.random(), 1.5) * 0.62 + 0.08;
+      const allow = hw * Math.sin(Math.min(yf * 1.5, 1) * Math.PI * 0.5) * 0.62;
+      const px = cx + rand(-1, 1) * allow, py = by - yf * PH;
+      const r = rand(1.3, 3.3) * (1.2 - yf);
+      x.fillStyle = 'rgba(0,0,0,0.22)';
+      x.beginPath(); x.ellipse(px + r * 0.5, py + r * 0.6, r * 1.1, r * 0.8, 0, 0, Math.PI * 2); x.fill();
+      const rg = x.createRadialGradient(px - r * 0.3, py - r * 0.3, 0, px, py, r * 1.3);
+      rg.addColorStop(0, css(mix(pal.spot, 0xffffff, 0.35), 0.95));
+      rg.addColorStop(0.6, css(pal.spot, 0.9));
+      rg.addColorStop(1, css(pal.spot, 0));
+      x.fillStyle = rg;
+      x.beginPath(); x.arc(px, py, r * 1.3, 0, Math.PI * 2); x.fill();
+    }
+
+    // 8) ponta virada para trás (parte de baixo da pétala aparece)
+    g = x.createLinearGradient(0, ty, 0, ty + PH * 0.15);
+    g.addColorStop(0, 'rgba(255,255,255,0.28)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = g; x.fillRect(0, ty, W, PH * 0.15);
+    x.strokeStyle = 'rgba(0,0,0,0.14)'; x.lineWidth = 2;
+    x.beginPath(); x.moveTo(cx - hw * 0.4, ty + PH * 0.15);
+    x.quadraticCurveTo(cx, ty + PH * 0.1, cx + hw * 0.4, ty + PH * 0.15); x.stroke();
+
+    // 9) borda escurecida por dentro + fio de luz
+    outline(); x.lineWidth = 6; x.strokeStyle = 'rgba(0,0,0,0.20)'; x.stroke();
+    outline(); x.lineWidth = 1.2; x.strokeStyle = css(pal.edge, 0.35); x.stroke();
+
+    x.restore();
+    addNoise(x, W, H, 14);
+
+    const tex = PIXI.Texture.from(c);
+    petalTextures.push(tex);
+    return tex;
+  }
+
+  // ================= TEXTURA: garganta, antera, botão, folha, laço =================
+  function makeThroatTexture() {
+    const [c, x] = newCanvas(128, 128);
+    x.translate(64, 64);
+    const g = x.createRadialGradient(0, 0, 0, 0, 0, 64);
+    g.addColorStop(0, 'rgba(205,235,120,1)');
+    g.addColorStop(0.35, 'rgba(125,175,55,0.92)');
+    g.addColorStop(0.7, 'rgba(80,130,40,0.35)');
+    g.addColorStop(1, 'rgba(80,130,40,0)');
+    x.fillStyle = g; x.beginPath(); x.arc(0, 0, 64, 0, Math.PI * 2); x.fill();
+    for (let i = 0; i < 6; i++) {
+      x.save(); x.rotate((i * Math.PI) / 3);
+      const lg = x.createLinearGradient(0, 0, 0, -58);
+      lg.addColorStop(0, 'rgba(40,90,20,0.45)');
+      lg.addColorStop(1, 'rgba(40,90,20,0)');
+      x.strokeStyle = lg; x.lineWidth = 4;
+      x.beginPath(); x.moveTo(0, 0); x.lineTo(0, -58); x.stroke();
+      x.restore();
+    }
+    return PIXI.Texture.from(c);
+  }
+
+  function makeAntherTexture() {
+    const [c, x] = newCanvas(40, 72);
+    x.shadowColor = 'rgba(245,160,40,0.9)'; x.shadowBlur = 5;
+    for (let i = 0; i < 26; i++) {
+      x.fillStyle = `rgba(245,${Math.round(rand(140, 190))},40,${rand(0.5, 0.95)})`;
+      x.beginPath(); x.arc(20 + rand(-11, 11), 36 + rand(-26, 26), rand(0.8, 1.7), 0, Math.PI * 2); x.fill();
+    }
+    x.shadowBlur = 0;
+    const g = x.createLinearGradient(12, 0, 28, 0);
+    g.addColorStop(0, '#3a1204'); g.addColorStop(0.4, '#92421a'); g.addColorStop(0.62, '#b25a24'); g.addColorStop(1, '#3a1204');
+    x.fillStyle = g; x.beginPath(); x.ellipse(20, 36, 7, 24, 0, 0, Math.PI * 2); x.fill();
+    x.fillStyle = 'rgba(255,200,120,0.35)';
+    x.beginPath(); x.ellipse(18, 30, 1.8, 14, 0, 0, Math.PI * 2); x.fill();
+    return PIXI.Texture.from(c);
+  }
+
+  const BW = 70, BH = 170, BP = 6;
+  function makeBudTexture(color) {
+    const [c, x] = newCanvas(BW, BH);
+    const cx = BW / 2, by = BH - BP, ty = BP;
+    const shape = () => {
+      x.beginPath(); x.moveTo(cx, by);
+      x.bezierCurveTo(cx + 26, by - 30, cx + 22, by - 110, cx + 2, ty + 2);
+      x.bezierCurveTo(cx - 22, by - 110, cx - 26, by - 30, cx, by);
+      x.closePath();
+    };
+    x.save(); x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 6; x.shadowOffsetY = 2;
+    shape(); x.fillStyle = css(color); x.fill(); x.restore();
+    x.save(); shape(); x.clip();
+    let g = x.createLinearGradient(0, by, 0, ty);
+    g.addColorStop(0, '#4f8f32'); g.addColorStop(0.28, css(mix(0x6aa83a, color, 0.45)));
+    g.addColorStop(0.55, css(color)); g.addColorStop(1, css(mix(color, 0xffffff, 0.3)));
+    x.fillStyle = g; x.fillRect(0, 0, BW, BH);
+    g = x.createLinearGradient(cx - 26, 0, cx + 26, 0);
+    g.addColorStop(0, 'rgba(255,255,255,0.18)'); g.addColorStop(0.5, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.30)');
+    x.fillStyle = g; x.fillRect(0, 0, BW, BH);
+    for (const s of [-1, 0, 1]) {            // três nervuras das pétalas fechadas
+      x.beginPath(); x.moveTo(cx + s * 4, by);
+      x.quadraticCurveTo(cx + s * 22, by - 80, cx + s * 1.5, ty + 4);
+      x.lineWidth = 1.6; x.strokeStyle = 'rgba(0,0,0,0.22)'; x.stroke();
+      x.lineWidth = 1; x.strokeStyle = 'rgba(255,255,255,0.22)'; x.translate(1.4, 0); x.stroke(); x.translate(-1.4, 0);
+    }
+    x.restore();
+    addNoise(x, BW, BH, 12);
+    return PIXI.Texture.from(c);
+  }
+
+  const LW = 100, LH = 330, LP = 8;
+  function makeLeafTexture(hueMix) {
+    const [c, x] = newCanvas(LW, LH);
+    const cx = LW / 2, by = LH - LP, ty = LP, hw = LW / 2 - LP - 2, len = by - ty;
+    const shape = () => {
+      x.beginPath(); x.moveTo(cx, by);
+      x.bezierCurveTo(cx + hw * 1.5, by - len * 0.25, cx + hw * 1.2, by - len * 0.72, cx + 3, ty);
+      x.bezierCurveTo(cx - hw * 1.2, by - len * 0.72, cx - hw * 1.5, by - len * 0.25, cx, by);
+      x.closePath();
+    };
+    x.save(); x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 6; x.shadowOffsetY = 2;
+    shape(); x.fillStyle = '#2a7a34'; x.fill(); x.restore();
+    x.save(); shape(); x.clip();
+    const dark = mix(0x1a5224, 0x1f6a2c, hueMix), midc = mix(0x2f8a3a, 0x3f9a48, hueMix), light = mix(0x3fa04a, 0x66b858, hueMix);
+    let g = x.createLinearGradient(cx - hw, 0, cx + hw, 0);
+    g.addColorStop(0, css(dark)); g.addColorStop(0.35, css(midc)); g.addColorStop(0.5, css(light));
+    g.addColorStop(0.65, css(midc)); g.addColorStop(1, css(dark));
+    x.fillStyle = g; x.fillRect(0, 0, LW, LH);
+    g = x.createLinearGradient(0, by, 0, ty);
+    g.addColorStop(0, 'rgba(0,30,0,0.4)'); g.addColorStop(0.35, 'rgba(0,30,0,0)'); g.addColorStop(1, 'rgba(210,255,150,0.18)');
+    x.fillStyle = g; x.fillRect(0, 0, LW, LH);
+    for (let k = 1; k <= 6; k++) for (const s of [-1, 1]) {   // veias paralelas
+      x.beginPath(); x.moveTo(cx + s * k * hw * 0.15, by - 10);
+      x.quadraticCurveTo(cx + s * k * hw * 0.2, by - len * 0.5, cx + 3 + s * k * 0.7, ty + k * 5);
+      x.lineWidth = 1; x.strokeStyle = 'rgba(190,235,150,0.16)'; x.stroke();
+    }
+    const rib = () => { x.beginPath(); x.moveTo(cx, by); x.quadraticCurveTo(cx + 1, by - len * 0.5, cx + 3, ty + 4); };
+    x.lineWidth = 2.4; x.strokeStyle = 'rgba(205,240,170,0.7)'; rib(); x.stroke();
+    x.lineWidth = 1.2; x.strokeStyle = 'rgba(0,40,0,0.35)'; x.translate(2, 0); rib(); x.stroke(); x.translate(-2, 0);
+    softStroke(x, () => { x.beginPath(); x.moveTo(cx + hw * 0.5, by - len * 0.12); x.quadraticCurveTo(cx + hw * 0.8, by - len * 0.5, cx + hw * 0.1, ty + len * 0.16); },
+      'rgba(255,255,255,ALPHA)', 9, 0.20);          // brilho de folha lisa
+    x.restore();
+    addNoise(x, LW, LH, 12);
+    return PIXI.Texture.from(c);
+  }
+
+  const BOWW = 360, BOWH = 300, BOWCY = 110;
+  function makeBowTexture() {
+    const [c, x] = newCanvas(BOWW, BOWH);
+    const cx = 180, cy = BOWCY;
+    for (const side of [-1, 1]) {                  // pontas
+      x.save(); x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 10; x.shadowOffsetY = 4;
+      x.beginPath(); x.moveTo(cx + side * 4, cy + 6);
+      x.bezierCurveTo(cx + side * 30, cy + 60, cx + side * 50, cy + 120, cx + side * 62, cy + 176);
+      x.lineTo(cx + side * 38, cy + 158); x.lineTo(cx + side * 22, cy + 188);
+      x.bezierCurveTo(cx + side * 18, cy + 130, cx + side * 4, cy + 70, cx - side * 2, cy + 10);
+      x.closePath();
+      const g = x.createLinearGradient(cx, cy, cx + side * 60, cy + 180);
+      g.addColorStop(0, '#c02a6e'); g.addColorStop(0.5, '#ff6bb0'); g.addColorStop(1, '#a01c5a');
+      x.fillStyle = g; x.fill(); x.restore();
+      x.strokeStyle = 'rgba(255,255,255,0.3)'; x.lineWidth = 3; x.lineCap = 'round';
+      x.beginPath(); x.moveTo(cx + side * 14, cy + 20); x.quadraticCurveTo(cx + side * 34, cy + 90, cx + side * 44, cy + 150); x.stroke();
+    }
+    for (const side of [-1, 1]) {                  // laços
+      x.save(); x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 12; x.shadowOffsetY = 4;
+      x.beginPath(); x.moveTo(cx, cy);
+      x.bezierCurveTo(cx + side * 30, cy - 82, cx + side * 150, cy - 70, cx + side * 150, cy);
+      x.bezierCurveTo(cx + side * 150, cy + 60, cx + side * 50, cy + 60, cx, cy);
+      const g = x.createLinearGradient(cx, cy, cx + side * 150, cy);
+      g.addColorStop(0, '#a01c5a'); g.addColorStop(0.3, '#e8408a'); g.addColorStop(0.55, '#ff8cc4');
+      g.addColorStop(0.85, '#d02c76'); g.addColorStop(1, '#8a1448');
+      x.fillStyle = g; x.fill(); x.restore();
+      x.beginPath(); x.moveTo(cx, cy);                                     // dobra interna
+      x.bezierCurveTo(cx + side * 24, cy - 48, cx + side * 96, cy - 40, cx + side * 98, cy + 2);
+      x.bezierCurveTo(cx + side * 96, cy + 36, cx + side * 34, cy + 36, cx, cy);
+      x.fillStyle = 'rgba(120,20,70,0.40)'; x.fill();
+      x.strokeStyle = 'rgba(255,255,255,0.45)'; x.lineWidth = 4; x.lineCap = 'round';
+      x.beginPath(); x.moveTo(cx + side * 34, cy - 40); x.quadraticCurveTo(cx + side * 100, cy - 58, cx + side * 134, cy - 16); x.stroke();
+    }
+    x.save(); x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 8; x.shadowOffsetY = 3;
+    const kg = x.createRadialGradient(cx - 5, cy - 5, 1, cx, cy, 20);
+    kg.addColorStop(0, '#ffb0d6'); kg.addColorStop(0.5, '#e0357f'); kg.addColorStop(1, '#8a1448');
+    x.fillStyle = kg; x.beginPath(); x.arc(cx, cy, 19, 0, Math.PI * 2); x.fill(); x.restore();
+    return PIXI.Texture.from(c);
+  }
+
+  // ================= lírio (sprites) =================
+  const throatTex = makeThroatTexture();
+  const antherTex = makeAntherTexture();
+  const leafTex = [makeLeafTexture(0.1), makeLeafTexture(0.5), makeLeafTexture(0.9)];
+  const bowTex = makeBowTexture();
+
+  function makeLily(L, pal) {
+    const lily = new PIXI.Container();
+    lily.petals = [];
+    lily.stamens = [];
+
+    const outerT = [makePetalTexture(pal, false), makePetalTexture(pal, false)];
+    const innerT = [makePetalTexture(pal, true), makePetalTexture(pal, true)];
+    const anchorY = (PH + PAD) / (PH + PAD * 2);
+
+    for (let ring = 0; ring < 2; ring++) {
+      const lenK = (ring === 0 ? L : L * 0.93) / PH;
+      for (let i = 0; i < 3; i++) {
+        const p = new PIXI.Sprite((ring === 0 ? outerT : innerT)[i % 2]);
+        p.anchor.set(0.5, anchorY);
+        p.sx0 = lenK * (Math.random() < 0.5 ? -1 : 1) * rand(0.95, 1.08);
+        p.sy0 = lenK * rand(0.96, 1.04);
+        p.scale.set(p.sx0, p.sy0);
+        p.base = (i * Math.PI * 2) / 3 + ring * (Math.PI / 3) + rand(-0.06, 0.06);
+        p.rotation = p.base;
+        lily.addChild(p);
+        lily.petals.push(p);
+      }
+    }
+
+    const th = new PIXI.Sprite(throatTex);
+    th.anchor.set(0.5);
+    th.width = th.height = L * 0.5;
+    lily.addChild(th);
+
+    // estames: filete curvo + antera com pólen
+    for (let i = 0; i < 6; i++) {
+      const s = new PIXI.Container();
+      const len = L * rand(0.5, 0.72), bend = rand(-0.25, 0.25);
+      const cxp = len * bend, cyp = -len * 0.55, ex = len * bend * 0.6, ey = -len;
+      const fil = new PIXI.Graphics();
+      fil.moveTo(0, 0).quadraticCurveTo(cxp, cyp, ex, ey).stroke({ width: Math.max(1.4, L * 0.02), color: 0xaab27a });
+      fil.moveTo(-0.6, 0).quadraticCurveTo(cxp - 0.6, cyp, ex - 0.6, ey).stroke({ width: Math.max(0.8, L * 0.01), color: 0xf0f5d0 });
+      s.addChild(fil);
+      const an = new PIXI.Sprite(antherTex);
+      an.anchor.set(0.5);
+      an.height = L * 0.2; an.width = an.height * 0.5;
+      an.position.set(ex, ey);
+      an.rotation = Math.atan2(ex - cxp, -(ey - cyp));
+      s.addChild(an);
+      s.rotation = (i * Math.PI) / 3 + rand(-0.25, 0.25);
+      lily.addChild(s);
+      lily.stamens.push(s);
+    }
+
+    // pistilo com estigma de três lóbulos
+    const pistil = new PIXI.Container();
+    const pg = new PIXI.Graphics();
+    pg.moveTo(0, 0).lineTo(L * 0.03, -L * 0.8).stroke({ width: Math.max(1.8, L * 0.026), color: 0xb4cc78 });
+    pg.moveTo(-0.7, 0).lineTo(L * 0.03 - 0.7, -L * 0.8).stroke({ width: Math.max(0.8, L * 0.01), color: 0xe4f0b4 });
+    for (const a of [-0.5, 0, 0.5]) {
+      pg.ellipse(L * 0.03 + Math.sin(a) * L * 0.03, -L * 0.8 - Math.cos(a) * L * 0.02, L * 0.025, L * 0.035).fill(0xc2d870);
+    }
+    pistil.addChild(pg);
+    lily.addChild(pistil);
+    lily.stamens.push(pistil);
+
+    return lily;
+  }
+
+  function setOpen(f, o, t) {
+    const sx = 0.2 + 0.8 * o, sy = 0.5 + 0.5 * o;
+    f.petals.forEach((p, i) => {
+      p.scale.set(p.sx0 * sx, p.sy0 * sy);
+      p.rotation = p.base + Math.sin(t * 1.1 + f.phase + i) * 0.035 * o;
+    });
+    for (const s of f.stamens) s.scale.set(0.3 + 0.7 * o);
+  }
+
+  function makeBud(color) {
+    const spr = new PIXI.Sprite(makeBudTexture(color));
+    spr.anchor.set(0.5, (BH - BP) / BH);
+    spr.scale.set(0.4);
+    const c = new PIXI.Container();
+    c.addChild(spr);
+    return c;
+  }
+
+  // ================= cena (recebe o filtro ASCII) =================
+  const scene = new PIXI.Container();
+  app.stage.addChild(scene);
+
+  const stars = new PIXI.Graphics();
+  for (let i = 0; i < 180; i++) {
+    stars.circle(rand(0, app.screen.width), rand(0, app.screen.height), rand(0.6, 1.7))
+      .fill({ color: 0xffffff, alpha: rand(0.3, 1) });
+  }
+  scene.addChild(stars);
+
+  const halo = new PIXI.Graphics();
+  for (let i = 0; i < 14; i++) halo.circle(0, 0, 40 + i * 28).fill({ color: 0xff4f9a, alpha: 0.012 });
+  halo.alpha = 0;
+  scene.addChild(halo);
+
+  const bouquet = new PIXI.Container();
+  scene.addChild(bouquet);
+
+  const flowerData = [
+    { x:  -10, y: -340, L: 105, c: PAL.red    },
+    { x: -105, y: -260, L:  95, c: PAL.pink   },
+    { x:   85, y: -250, L: 105, c: PAL.cream  },
+    { x: -150, y: -350, L:  72, c: PAL.yellow },
+    { x:  150, y: -340, L:  75, c: PAL.orange },
+    { x:  -35, y: -450, L:  80, c: PAL.peach  },
+    { x: -170, y: -175, L:  78, c: PAL.yellow },
+    { x:  170, y: -160, L:  68, c: PAL.dark   },
+    { x:   10, y: -160, L:  92, c: PAL.peach  },
+    { x:   62, y: -395, L:  62, c: PAL.blush  },
+    { x:  -95, y: -420, L:  58, c: PAL.cream  },
+  ];
+  const budData = [
+    { x:  -90, y: -570, c: 0xb06070 },
+    { x:  -40, y: -620, c: 0x8a3040 },
+    { x:   55, y: -595, c: 0xc08090 },
+    { x:  110, y: -540, c: 0xd0a040 },
+  ];
+
+  function makeLeafSprite(len, widthK) {
+    const s = new PIXI.Sprite(leafTex[Math.floor(Math.random() * leafTex.length)]);
+    s.anchor.set(0.5, (LH - LP) / LH);
+    s.sy0 = len / (LH - LP * 2);
+    s.sx0 = s.sy0 * widthK * (Math.random() < 0.5 ? -1 : 1);
+    s.scale.set(0);
+    return s;
+  }
+  const setLeafGrow = (s, e) => s.scale.set(s.sx0 * e, s.sy0 * e);
+
+  // folhas da base
+  const baseLeaves = [];
+  const leafLayer = new PIXI.Container();
+  bouquet.addChild(leafLayer);
+  for (let i = 0; i < 11; i++) {
+    const g = makeLeafSprite(rand(130, 220), rand(0.9, 1.3));
+    g.y = -rand(5, 90);
+    g.rotation = rand(-1.3, 1.3);
+    g.delay = rand(0.2, 2.5);
+    leafLayer.addChild(g);
+    baseLeaves.push(g);
+  }
+
+  const stemsG = new PIXI.Graphics();
+  bouquet.addChild(stemsG);
+
+  function bez(sd, u) {
+    const cx = sd.x * 0.6, cy = sd.y * 0.5;
+    const a = (1 - u) * (1 - u), b = 2 * (1 - u) * u, c = u * u;
+    return { x: a * sd.endX + b * cx + c * sd.x, y: b * cy + c * sd.y };
+  }
+
+  const stems = [];
+  const all = [
+    ...flowerData.map(d => ({ ...d, bud: false })),
+    ...budData.map(d => ({ ...d, bud: true })),
+  ];
+
+  all.forEach((d, i) => {
+    const sd = {
+      ...d,
+      endX: rand(-18, 18),
+      delay: i * 0.2 + rand(0, 0.2),
+      dur: rand(2.2, 3.2),
+      width: d.bud ? 3.5 : 6,
+      col: mix(0x3a8a3a, 0x74b45c, Math.random()),
+      leaves: [],
+    };
+    sd.bloomStart = sd.delay + sd.dur + 0.2;
+
+    const nLeaves = d.bud ? 1 : 2;
+    for (let k = 0; k < nLeaves; k++) {
+      const g = makeLeafSprite(rand(65, 120), rand(0.8, 1.1));
+      g.u = rand(0.18, 0.6);
+      const pt = bez(sd, g.u);
+      g.position.set(pt.x, pt.y);
+      g.rotation = (k % 2 ? 1 : -1) * rand(0.7, 1.2);
+      bouquet.addChild(g);
+      sd.leaves.push(g);
+    }
+    stems.push(sd);
+  });
+
+  // laço
+  const bow = new PIXI.Sprite(bowTex);
+  bow.anchor.set(0.5, BOWCY / BOWH);
+  bow.position.set(0, -50);
+  bow.scale.set(0);
+  bouquet.addChild(bow);
+  const bowStart = Math.max(...stems.map(s => s.delay + s.dur)) - 0.5;
+
+  // flores e botões
+  stems.forEach(sd => {
+    const f = sd.bud ? makeBud(sd.c) : makeLily(sd.L, sd.c);
+    f.baseRot = sd.bud ? rand(-0.25, 0.25) : rand(0, Math.PI * 2);
+    f.tilt = sd.bud ? 1 : rand(0.82, 1);
+    f.phase = rand(0, Math.PI * 2);
+    f.visible = false;
+    bouquet.addChild(f);
+    sd.flower = f;
+  });
+
+  // pétalas caindo (usam as mesmas texturas das flores)
+  const fall = new PIXI.Container();
+  scene.addChild(fall);
+  const fallPetals = [];
+  for (let i = 0; i < 34; i++) {
+    const g = new PIXI.Sprite(petalTextures[Math.floor(Math.random() * petalTextures.length)]);
+    g.anchor.set(0.5);
+    g.scale.set(rand(0.08, 0.14));
+    g.x = rand(0, app.screen.width);
+    g.y = rand(-app.screen.height, 0);
+    g.vy = rand(18, 45);
+    g.sway = rand(0.6, 1.6);
+    g.amp = rand(10, 30);
+    g.phase = rand(0, Math.PI * 2);
+    g.spin = rand(-1.5, 1.5);
+    g.baseX = g.x;
+    fall.addChild(g);
+    fallPetals.push(g);
+  }
+  fall.alpha = 0;
+
+  // desenha o caule com 3 passadas (sombra, cor, luz)
+  function strokePoly(pts, width, color, alpha = 1, dx = 0) {
+    stemsG.moveTo(pts[0].x + dx, pts[0].y);
+    for (let i = 1; i < pts.length; i++) stemsG.lineTo(pts[i].x + dx, pts[i].y);
+    stemsG.stroke({ width, color, alpha, cap: 'round', join: 'round' });
+  }
+
+  // ================= filtro ASCII (liga/desliga) =================
+  const ascii = new PIXI.filters.AsciiFilter({ size: 6, color: 0xffffff, replaceColor: false });
+  let asciiOn = true;
+  scene.filters = [ascii];
+  const btn = document.getElementById('toggle');
+  function toggleAscii() {
+    asciiOn = !asciiOn;
+    scene.filters = asciiOn ? [ascii] : [];
+    btn.textContent = 'ASCII: ' + (asciiOn ? 'ON' : 'OFF');
+  }
+  btn.addEventListener('click', toggleAscii);
+  window.addEventListener('keydown', e => { if (e.key === 'a' || e.key === 'A') toggleAscii(); });
+
+  // ================= texto (fora do filtro, fica nítido) =================
+  const message = 'Te amo Bianca';
+  const label = new PIXI.Text({
+    text: '',
+    style: {
+      fontFamily: 'Courier New, monospace',
+      fontWeight: 'bold',
+      fontSize: 40,
+      fill: 0xffc2e0,
+      dropShadow: { color: 0xff4fa0, alpha: 0.85, blur: 12, distance: 0, angle: 0 },
+    },
+  });
+  app.stage.addChild(label);
+
+  // ================= layout responsivo =================
+  function layout() {
+    const w = app.screen.width, h = app.screen.height;
+    const wide = w > h * 0.95;
+    const s = Math.min(h / 780, (wide ? w * 0.55 : w) / 520);
+    bouquet.scale.set(s);
+    bouquet.position.set(wide ? w * 0.36 : w / 2, h * 0.96);
+    halo.scale.set(s);
+    halo.position.set(bouquet.x, bouquet.y - 300 * s);
+
+    label.style.fontSize = Math.max(22, Math.min(52, wide ? w * 0.035 : w * 0.07));
+    if (wide) {
+      label.anchor.set(0, 0.5);
+      label.position.set(bouquet.x + 270 * s, h * 0.45);
+    } else {
+      label.anchor.set(0.5, 0.5);
+      label.position.set(w / 2, h * 0.06);
+    }
+  }
+  layout();
+  app.renderer.on('resize', layout);
+
+  // ================= interação =================
+  let t = 0;
+  let tilt = 0;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointermove', e => { tilt = (e.global.x / app.screen.width - 0.5) * 0.12; });
+  app.stage.on('pointerdown', () => { t = 0; });
+
+  const lastBloom = Math.max(...stems.filter(s => !s.bud).map(s => s.bloomStart));
+  const textStart = lastBloom + 1.2;
+
+  // ================= animação =================
+  app.ticker.add(ticker => {
+    const dt = ticker.deltaMS / 1000;
+    t += dt;
+
+    bouquet.rotation += (tilt + Math.sin(t * 0.6) * 0.02 - bouquet.rotation) * 0.05;
+
+    for (const g of baseLeaves) setLeafGrow(g, ease((t - g.delay) / 1.8));
+    bow.scale.set(easeBack((t - bowStart) / 0.9) * 0.62);
+
+    stemsG.clear();
+    for (const sd of stems) {
+      const p = easeOut((t - sd.delay) / sd.dur);
+
+      if (p > 0) {
+        const n = Math.ceil(36 * p) + 1, pts = [];
+        for (let i = 0; i <= n; i++) pts.push(bez(sd, (i / n) * p));
+        strokePoly(pts, sd.width + 2, mix(sd.col, 0x000000, 0.45), 0.9);
+        strokePoly(pts, sd.width, sd.col);
+        strokePoly(pts, Math.max(1, sd.width * 0.3), mix(sd.col, 0xffffff, 0.5), 0.6, -sd.width * 0.15);
+      }
+
+      for (const lf of sd.leaves) setLeafGrow(lf, ease((p - lf.u) / 0.25));
+
+      const f = sd.flower;
+      const tip = bez(sd, p);
+      f.position.set(tip.x, tip.y);
+
+      if (sd.bud) {
+        const sc = ease((p - 0.85) / 0.15);
+        f.visible = sc > 0.01;
+        f.scale.set(sc);
+        f.rotation = f.baseRot + Math.sin(t * 0.9 + f.phase) * 0.05;
+      } else {
+        const o = ease((t - sd.bloomStart) / 2.2);
+        const sc = p < 1 ? ease((p - 0.6) / 0.4) * 0.25 : 0.25 + 0.75 * o;
+        f.visible = sc > 0.01;
+        setOpen(f, o, t);
+        f.scale.set(sc, sc * f.tilt);
+        f.rotation = f.baseRot + (1 - o) * 1.4 + Math.sin(t * 0.8 + f.phase) * 0.06;
+      }
+    }
+
+    halo.alpha = ease((t - lastBloom) / 2.5);
+    fall.alpha = ease((t - lastBloom) / 2.5);
+    if (fall.alpha > 0) {
+      const h = app.screen.height, w = app.screen.width;
+      for (const g of fallPetals) {
+        g.y += g.vy * dt;
+        g.x = g.baseX + Math.sin(t * g.sway + g.phase) * g.amp;
+        g.rotation += g.spin * dt;
+        if (g.y > h + 20) { g.y = -20; g.baseX = rand(0, w); }
+      }
+    }
+
+    stars.alpha = 0.7 + Math.sin(t * 1.5) * 0.3;
+
+    if (t >= textStart - 0.3) {
+      const n = Math.max(0, Math.floor((t - textStart) * 7));
+      const cursor = Math.floor(t * 2) % 2 === 0 ? '█' : ' ';
+      label.text = message.slice(0, n) + cursor;
+    } else {
+      label.text = '';
+    }
+  });
+})();
+</script>
+</body>
+</html>
